@@ -1,0 +1,1327 @@
+---
+title: "CAR-T cell scMulti-omics analysis"
+output:
+  pdf_document: default
+  html_notebook: default
+editor_options:
+  chunk_output_type: inline
+---
+
+
+
+## Overview 
+
+Analysis of Rhapsody targeted RNA-seq and Ab-seq data for CAR-T project.
+
+## Prepare for the analysis 
+
+Load the required libraries in R, set a seed and make a directory to hold the results
+
+```{r}
+#load packages
+package_list <- c(
+  "tidyverse", "Seurat", "patchwork", "SeuratDisk", "ggplot2", "ggrepel", "multimode", "dplyr", "EnhancedVolcano", "writexl", "cowplot", "RColorBrewer", "sctransform", "ggpubr", "ggVennDiagram", "rstatix", "ggh4x"
+)
+invisible(lapply(package_list, require, character.only = TRUE))
+
+set.seed(38) # set a seed to ensure the analysis is reproducible 
+
+# create a directory for the results
+results_dir <- "C:/Single Cell Sequencing/R-analysis/CarT/results/"
+if (!dir.exists(results_dir)) {
+  dir.create(results_dir, recursive = TRUE)
+}
+
+```
+
+
+## Add sample information
+
+Here we make a data frame to hold the information about the project including the donor of origin and Rhapsody cartridge used for each sample
+
+```{r}
+sample_info <-data.frame(id = c("VSV_LV_D1","VSV_LV_D2","CD3_LV_D1","CD3_LV_D2","CD4_LV_D1",
+                                   "CD4_LV_D2","CD8_LV_D1","CD8_LV_D2"
+                                   ),
+                         sample_type = c("VSV_LV","VSV_LV","CD3_LV","CD3_LV","CD4_LV",
+                                         "CD4_LV","CD8_LV","CD8_LV"
+                                         ),
+                         donor=c("D1","D2","D1","D2","D1",
+                                 "D2","D1","D2"),
+                         cartridge=c("A","B","A","B","C","C",
+                                     "C","C"))
+```
+
+## Create functions to filter and load 
+
+Create a function to filter the cells by UMI count per cell. 
+
+```{r}
+filter_cells <- function(object) {
+  
+  # thresholds for nUMI
+  log_umi_counts <- log10(object@meta.data$nCount_RNA)
+  low_count_threshold <- median(log_umi_counts) - (3 * mad(log_umi_counts))
+  high_count_threshold <- median(log_umi_counts) + (3 * mad(log_umi_counts))
+
+ 
+  # filter cells
+  object <- subset(
+    object,
+      nCount_RNA > 10^low_count_threshold &
+      nCount_RNA < 10^high_count_threshold
+  )
+
+   # show the filtered cell summary
+  print(object)
+
+  return(object)
+}
+```
+
+Create a function to import the gene expression data obtained from SeqGeq after demultiplexing and add the meta data for each sample
+
+```{r}
+
+import_rhapsody_data <- function(sample_info) {
+  raw_data <- read_csv(
+    paste0("raw_data/",sample_info$id,".csv"), skip = 5 # don't import the first 5 rows of the file, doesn't contain any information
+    ) %>% 
+    slice(1:(n()-1)) # remove the last row which has the "Lex_BD_SMK_ID_P96H" type ID
+  
+  # scRNA-seq
+  #print(sample_info)
+  gene_expression_data_no_rn <- raw_data %>%
+  filter(!str_detect(raw_data$Gene, "\\(Ab\\)")) 
+  
+  gene_expression_data <- as.data.frame(gene_expression_data_no_rn[,-1])
+  
+  rownames(gene_expression_data) <- gene_expression_data_no_rn$Gene
+  
+  seurat_object_meta_data <- data.frame(
+    donor=rep(sample_info$donor, dim(gene_expression_data)[2]),
+    cartridge=rep(sample_info$cartridge, dim(gene_expression_data)[2]),
+    sample=sample_info$sample_type, 
+    id=sample_info$id
+    
+    )
+  
+  rownames(seurat_object_meta_data) <- colnames(gene_expression_data)
+  
+  # create the seurat object
+  seurat_object <- CreateSeuratObject(
+    counts = gene_expression_data,
+    genes.field = 1,
+    project = "cart_t_citeseq",
+    assay="RNA",
+    meta.data = seurat_object_meta_data
+    )
+  
+  # Ab-seq
+  protein_expression_data_no_rn <- raw_data %>%
+  filter(str_detect(raw_data$Gene, "\\(Ab\\)")) 
+  
+  
+  protein_expression_data <- as.data.frame(protein_expression_data_no_rn[,-1])
+  rownames(protein_expression_data) <- str_replace(protein_expression_data_no_rn$Gene, " \\(Ab\\)", ".Ab")
+  
+  # create the seurat assay for abseq
+  abseq_assay <- CreateAssayObject(counts = protein_expression_data)
+  
+  # add the abseq data to the seurat object
+  seurat_object[["ABSEQ"]] <- abseq_assay
+  #print(seurat_object)
+  
+  
+  DefaultAssay(seurat_object) <- "RNA"
+  seurat_object <- filter_cells(seurat_object)
+
+}
+```
+
+# Load the samples
+
+For loop to load each sample
+
+```{r}
+for (i in 1:dim(sample_info)[1]){
+  suerat_object <- import_rhapsody_data(sample_info[i,])
+  assign(sample_info$id[i], suerat_object)
+}
+```
+
+# combine all seurat objects
+
+```{r}
+cart_combined <- merge(CD3_LV_D1,
+                       y = c(CD3_LV_D2,CD4_LV_D1, 
+        CD4_LV_D2,
+        CD8_LV_D1,
+        CD8_LV_D2,
+        VSV_LV_D1,
+        VSV_LV_D2),
+  add.cell.ids = c("lib1", "lib2", "lib3", "lib4", "lib5", "lib6","lib7", "lib8"),
+  project = "tcell", merge.data = TRUE
+)
+```
+
+# plot filtered cells
+
+```{r}
+FeatureScatter(cart_combined, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+```
+
+# Split the combined object by donor
+
+```{r}
+cart_combined.list <- SplitObject(cart_combined, split.by = c("donor"))
+```
+
+## preprocess the split objects
+
+**Note: the number of features included in FVF needs to be optimised**
+** Nr of genes in panel: 423, Nr of Abseqs: 33 (including both VSV and His)
+** include all genes and run the vars.to.regress = 'RNA' to Remove uninteresting sources of variation, This tool regresses on the number of detected molecules per cell 
+
+```{r}
+cart_combined.list <- lapply(X = cart_combined.list, FUN = function(x) {
+    x <- NormalizeData(x)
+    x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 423)
+})
+```
+
+## Integration
+
+*this is done only on the RNA-seq data
+
+*Select the integration features - i.e. the genes that will be used to do the integration
+
+```{r}
+features <- SelectIntegrationFeatures(object.list = cart_combined.list)
+```
+
+*Select the cell pairs used to pull the datasets together during MNN/CCA
+
+```{r}
+cart.anchors <- FindIntegrationAnchors(object.list = cart_combined.list, anchor.features = features)
+```
+
+**Integrate using the anchors
+
+```{r}
+cart.combined <- IntegrateData(anchorset = cart.anchors)
+```
+
+# Visualisation 
+## RNA-seq
+**Note: the number of PCs used for UMAP needs to be optimised**
+
+```{r}
+# use the integrated assay
+DefaultAssay(cart.combined) <- "integrated"
+
+# scale the data
+cart.combined <- ScaleData(cart.combined, verbose = FALSE)
+
+# PCA
+cart.combined <- RunPCA(cart.combined, npcs = 50, verbose = FALSE)
+ElbowPlot(cart.combined,ndims = 50, reduction = "pca")
+
+# choose the number of PCs and run UMAP
+cart.combined <- RunUMAP(cart.combined, reduction = "pca", dims = 1:15)
+
+# seurat cluster identification
+cart.combined <- FindNeighbors(cart.combined, reduction = "pca", dims = 1:15)
+cart.combined <- FindClusters(cart.combined, resolution = 0.5)
+
+#DimHeatmap(cart.combined, dims = 1, cells = 500, balanced = TRUE)
+
+```
+
+
+*Check to see if there's an obvious batch or donor effect
+*this is based on RNA data!
+
+```{r fig.height=10, fig.width=9}
+DimPlot(cart.combined, reduction = "umap", group.by = "donor", pt.size = 0.5, cols =c("pink", "darkgray")) + theme(legend.text = element_text(size = 22), plot.title = element_text(size =25), legend.position = "bottom")
+DimPlot(cart.combined, reduction = "umap", group.by = "cartridge", pt.size = 0.5) + theme(legend.text = element_text(size = 22), plot.title = element_text(size =25), legend.position = "bottom")
+```
+
+##Ab-seq
+
+Normalise Abseq data
+***Setting margin=2 normalizes for differences in ADT depth across cells.
+```{r}
+cart.combined <- NormalizeData(cart.combined, normalization.method = "CLR", assay = "ABSEQ", margin = 2)
+
+
+```
+
+## WNN analysis
+Weighted Nearest Neighbor,  WNN workflow for the analysis of multimodal single-cell datasets. 
+
+scale the abseq data
+FVF and PCA are required for MNN
+```{r}
+
+cart.combined <- FindVariableFeatures(cart.combined, selection.method = "vst",assay = "ABSEQ", nfeatures = 33)
+cart.combined <- ScaleData(cart.combined, assay = "ABSEQ")
+cart.combined <- RunPCA(cart.combined, npcs = 50, verbose = FALSE, reduction.name = 'apca', assay = "ABSEQ", approx = FALSE )
+ElbowPlot(cart.combined,ndims = 50, reduction = 'apca')
+rownames(cart.combined[["ABSEQ"]])
+RunUMAP(cart.combined, dims = 1:15, reduction.name = "apca", reduction.key = "apacUMAP_")
+DimPlot(cart.combined, reduction = "apca", group.by = "donor", split.by = "sample")
+```
+
+
+```{r}
+cart.combined <- FindMultiModalNeighbors(
+  cart.combined, reduction.list = list("pca", "apca"), 
+  dims.list = list(1:15, 1:15), modality.weight.name = "RNA.weight"
+)
+```
+
+#UMAP visualization of the data based on a weighted combination of RNA and protein data
+
+```{r}
+
+cart.combined <- RunUMAP(cart.combined, nn.name = "weighted.nn", reduction.name = "wnn.umap", reduction.key = "wnnUMAP_")
+cart.combined <- FindClusters(cart.combined, graph.name = "wsnn", algorithm = 3, resolution = 0.3, verbose = FALSE)
+DimPlot(cart.combined, reduction = "wnn.umap", pt.size = 0.5, group.by = "sample" ,repel = T, cols =c("#8B2252", "#8B5A00", "#104E8B", "#2E8B57"))+ theme(legend.text = element_text(size = 20))+ labs(title = NULL)
+
+DefaultAssay(cart.combined) <- "ABSEQ"
+FeaturePlot(cart.combined, "CD4:SK3.Ab", cols = c("lightgrey", "darkgreen"), max.cutoff = 'q99', reduction = "wnn.umap", pt.size = 0.5) + ggtitle("CD4 cells")
+
+FeaturePlot(cart.combined, "CD8:SK1.Ab", cols = c("lightgrey", "darkgreen"), max.cutoff = 'q99', reduction = "wnn.umap", pt.size = 0.5) + ggtitle("CD8 cells")
+```
+
+# Markers for cluster annotations
+
+```{r}
+#"CD19:SJ25C1.Ab"
+VlnPlot(cart.combined, features =  c("CD183.Ab"), pt.size = 0, assay = "ABSEQ", ncol = 1, group.by = "seurat_clusters", cols = brewer.pal(n=12, "Paired"))+NoLegend()+ theme(axis.text.x = element_text(size = 38), plot.title = element_text(size =40))
+
+
+#gene list ("MS4A1", "TRDC", "KLRB1", "FOXP3", "CTLA4", "GZMA", "GZMB", "GNLY", "GZMH")
+VlnPlot(cart.combined, features =  c("KLRB1"), pt.size = 0, assay = "RNA", ncol = 1, group.by = "seurat_clusters", cols = brewer.pal(n=12, "Paired"))+NoLegend()+ theme(axis.text.x = element_text(size = 38), plot.title = element_text(size =40))
+
+```
+
+# Heatmap of DEGs Abseqs in each cluster
+*Abseq
+
+```{r}
+cart.combined.ABSEQmarkers <- FindAllMarkers(cart.combined, only.pos = F, min.pct = 0.25, logfc.threshold = 0.25, assay = "ABSEQ" )
+
+top10 <- cart.combined.ABSEQmarkers %>% 
+  group_by(cluster) %>% 
+  top_n(n = 5, wt = avg_log2FC)
+
+top10
+```
+
+```{r}
+DefaultAssay(cart.combined) <- "ABSEQ"
+cart.combined.ABSEQmarkers %>%
+    group_by(cluster) %>%
+    top_n(n = 5, wt = avg_log2FC) -> top5
+DoHeatmap(cart.combined, features = top5$gene, assay = "ABSEQ", slot = "data", label = T, group.colors = brewer.pal(n=12, "Paired"), size = 5,  group.by = "seurat_clusters") + NoLegend()+ theme(axis.text.y = element_text(face = "bold", size = 20, color = "black"))
+```
+
+#cluster annotations
+
+```{r}
+# Rename cluster IDs
+new.cluster.ids <- c("0:CD8+ naive", 
+"1:CD4+ central memory",                                                                    
+"2:CD4+ CAR+ effector memory",
+"3:CD4+ cytotoxic", 
+"4:CD4+ activated", 
+"5:CD8+ His+ cytotoxic",
+"6:CD8+ central memory",
+"7:CD8+ CAR+ effector memory", 
+"8:CD8+ VSV-G+ cytotoxic" , 
+"9:gd /NKT ", 
+"10:Tregs", 
+"11:B cells")
+names(new.cluster.ids) <- levels(cart.combined)
+cart.combined <- RenameIdents(cart.combined, new.cluster.ids)
+cart.combined$Cell_type <- Idents(cart.combined)
+DimPlot(cart.combined, reduction = "wnn.umap", label = F, pt.size = 0.5, cols = brewer.pal(n=12, "Paired"), label.size = 5, repel = T)+ theme(legend.text = element_text(size = 20))
+```
+
+#blend features
+
+```{r}
+DefaultAssay(cart.combined) <- "ABSEQ"
+Idents(cart.combined) <- "sample"
+blend.features <- c("His.Ab","CAR-P.Ab")
+FeaturePlot(subset(cart.combined, idents = "CD3_LV" ) ,features = blend.features, blend = TRUE, pt.size = 1, max.cutoff = "q99", reduction = "wnn.umap", label = F, blend.threshold = 0.1, cols = c("lightgrey", "#E66900", "darkgreen"))
+FeaturePlot(subset(cart.combined, idents = "CD4_LV" ) ,features = blend.features, blend = TRUE, pt.size = 1, max.cutoff = "q99", reduction = "wnn.umap", label = F, blend.threshold = 0.1, cols = c("lightgrey", "#E66800", "darkgreen") )
+FeaturePlot(subset(cart.combined, idents = "CD8_LV" ) ,features = blend.features, blend = TRUE, pt.size = 1, max.cutoff = "q99", reduction = "wnn.umap", label = F, blend.threshold = 0.1, cols = c("lightgrey", "#E66800", "darkgreen") )
+blend.features <- c("VSV-G.Ab","CAR-P.Ab")
+FeaturePlot(subset(cart.combined, idents = "VSV_LV" ) ,features = blend.features, blend = TRUE, pt.size = 1, max.cutoff = "q99", reduction = "wnn.umap", label = F, blend.threshold = 0.1, cols = c("lightgrey", "#E66800", "darkgreen")  )
+
+```
+
+##Splits object into a list of subsetted objects
+
+```{r}
+
+# split the object to a list based on id
+sample.list <- SplitObject(cart.combined, split.by = "id")
+# create seurat objects out of list, use the double bracket notation to add metadata to a Seurat object.
+CD3_LV_D1 <- sample.list[["CD3_LV_D1"]]
+CD3_LV_D2 <- sample.list[["CD3_LV_D2"]]
+CD4_LV_D1 <- sample.list[["CD4_LV_D1"]]
+CD4_LV_D2 <- sample.list[["CD4_LV_D2"]]
+CD8_LV_D1 <- sample.list[["CD8_LV_D1"]]
+CD8_LV_D2 <- sample.list[["CD8_LV_D2"]]
+VSV_LV_D1 <- sample.list[["VSV_LV_D1"]]
+VSV_LV_D2 <- sample.list[["VSV_LV_D2"]]
+
+# split the object to a list based on sampel
+sample.list2 <- SplitObject(cart.combined, split.by = "sample")
+# create seurat objects out of list
+CD3_LV <- sample.list2[["CD3_LV"]]
+CD4_LV <- sample.list2[["CD4_LV"]]
+CD8_LV <- sample.list2[["CD8_LV"]]
+VSV_LV <- sample.list2[["VSV_LV"]]
+
+
+sample.list3 <- SplitObject(cart.combined, split.by = "donor")
+D1 <- sample.list3[["D1"]]
+D2 <- sample.list3[["D2"]]
+
+``` 
+
+## mulimodo analysis
+
+```{r}
+
+# Modes
+
+# Create the dataframes of gene or protein expression. Subset based on idents (VSV_LV etc) if needed
+Idents(cart.combined) <- "donor"
+data_df_CAR <- data.frame(Expression=cart.combined[["RNA"]]@data["CAR",]) # CAR
+
+data_df_CARpD1 <- data.frame(Expression=D1[["ABSEQ"]]@data["CAR-P.Ab",]) # CAR-P.Ab
+data_df_CARpD2 <- data.frame(Expression=D2[["ABSEQ"]]@data["CAR-P.Ab",]) # CAR-P.Ab
+
+data_df_His <- data.frame(Expression=cart.combined[["ABSEQ"]]@data["His.Ab",]) # His.Ab
+
+
+data_df_VSVG <- data.frame(Expression=cart.combined[["ABSEQ"]]@data["VSV-G.Ab",])# VSV-G.Ab
+
+
+# How many modes are there
+nmodes(data = data_df_CAR$Expression, bw = bw.nrd0(data_df_CAR$Expression), full.result = T) # CAR
+
+nmodes(data = data_df_CARpD1$Expression, bw = bw.nrd0(data_df_CARpD1$Expression), full.result = T) # CAR-P.Ab
+nmodes(data = data_df_CARpD2$Expression, bw = bw.nrd0(data_df_CARpD2$Expression), full.result = T) # CAR-P.Ab
+
+nmodes(data = data_df_His$Expression, bw = bw.nrd0(data_df_His$Expression), full.result = T) #  His.Ab
+
+
+nmodes(data = data_df_VSVG$Expression, bw = bw.nrd0(data_df_VSVG$Expression), full.result = T) #  VSV-G.Ab
+
+
+
+# Graph & calculations of density with modes/antimodes
+
+## CAR
+locmodes(data_df_CAR$Expression, mod0=2,lowsup=-Inf,uppsup=Inf,n=2^15,tol=10^(-5),display=T)
+
+### Define which are the antimodes and add the number in the expm1() to calculate the molecules per cell to be used in log1p(mols/cell)
+expm1(0.7694234)
+DefaultAssay(cart.combined) <- "RNA"
+VlnPlot(cart.combined, features = "CAR", pt.size = 0.01, group.by = "sample", cols =c("#8B2252", "#8B5A00", "#104E8B", "#2E8B57"))+geom_hline(yintercept = log1p(1.158521)) + theme(plot.title = element_text(size = 35), axis.title.x = element_blank(), axis.text.x = element_text(size = 25)) + NoLegend()
+
+## CAR-P
+#based on the different donor the number f modes and antimode will change:
+locmodes(data_df_CARpD1$Expression, mod0=12,lowsup=-Inf,uppsup=Inf,n=2^15,tol=10^(-5),display=T)
+locmodes(data_df_CARpD2$Expression, mod0=23,lowsup=-Inf,uppsup=Inf,n=2^15,tol=10^(-5),display=T)
+### Define which are the antimodes and add the number in the expm1() to calculate the molecules per cell to be used in log1p(mols/cell)
+expm1(1.766694) 
+expm1(1.190716)
+DefaultAssay(cart.combined) <- "ABSEQ"
+VlnPlot(D1, features = "CAR-P.Ab", pt.size = 0.01, group.by = "sample")+geom_hline(yintercept = log1p(3.3))
+VlnPlot(D2, features = "CAR-P.Ab", pt.size = 0.01, group.by = "sample")+geom_hline(yintercept = log1p(2.289436))
+
+## His
+locmodes(data_df_His$Expression, mod0=2,lowsup=-Inf,uppsup=Inf,n=2^15,tol=10^(-5),display=T)
+
+### Define which are the antimodes and add the number in the expm1() to calculate the molecules per cell to be used in log1p(mols/cell)
+expm1(0.4990077) 
+
+DefaultAssay(cart.combined) <- "ABSEQ"
+VlnPlot(cart.combined, features = "His.Ab", pt.size = 0.1, group.by = "sample")+geom_hline(yintercept = log1p(1.3))
+
+## VSVG
+locmodes(data_df_VSVG$Expression, mod0=10,lowsup=-Inf,uppsup=Inf,n=2^15,tol=10^(-5),display=T)
+### Define which are the antimodes and add the number in the expm1() to calculate the molecules per cell to be used in log1p(mols/cell)
+expm1(1.151325)
+
+DefaultAssay(cart.combined) <- "ABSEQ"
+VlnPlot(cart.combined, features = "VSV-G.Ab", pt.size = 0.01, group.by = "id")+geom_hline(yintercept = log1p(2.16238))
+
+```
+
+## find frequency of gene expression
+
+```{r}
+#CAR
+DefaultAssay(cart.combined) <- "RNA"
+table(subset(cart.combined, CAR > log1p(1.158521))$sample, subset(cart.combined, CAR > log1p(1.158521))$donor)/table(cart.combined$sample, cart.combined$donor)*100
+
+#CARp
+Idents(cart.combined) <- "donor"
+table(subset(D1, `CAR-P.Ab` > log1p(3.3))$sample) /table(D1$sample)*100
+table(subset(D2, `CAR-P.Ab` > log1p(2.289436))$sample) /table(D2$sample)*100
+
+#His
+DefaultAssay(cart.combined) <- "ABSEQ"
+table(subset(cart.combined, `His.Ab` > log1p(1.3))$sample, subset(cart.combined, `His.Ab` > log1p(1.3))$donor)/table(cart.combined$sample, cart.combined$donor)*100
+
+#VSV-G
+Idents(cart.combined) <- "sample"
+table(subset(cart.combined, idents = "VSV_LV", `VSV-G.Ab` > log1p(2.16238))$sample, subset(cart.combined,idents = "VSV_LV", `VSV-G.Ab` > log1p(2.16238))$donor)/table(subset(cart.combined, idents = "VSV_LV")$sample, subset(cart.combined, idents = "VSV_LV")$donor)*100
+```
+
+# add column to metadata
+
+```{r}
+# add a column to metadata
+# first use WhichCells to find the cells that express CAR and removing Bcells 
+# the sequence of codes in the pipe is important! 
+
+
+## RNA
+#CARrna
+DefaultAssay(cart.combined) <- "RNA"
+Idents(cart.combined) <- 'Cell_type'
+CARrna <- 
+  WhichCells(object = cart.combined, cells = "11:B cells", invert= TRUE)  %>%
+   WhichCells(object = cart.combined, expression = CAR > log1p(1.158521))
+
+# cell labels are returned
+
+head(CARrna)
+
+# we then add a new column to the meta data based on the presence of the cell label from WhichCells
+
+cart.combined$CARrna<- ifelse(colnames(cart.combined) %in% CARrna, "CAR+", "CAR-")
+
+# set the identities to the new column(s)
+Idents(cart.combined) <- "CARrna"
+
+
+
+
+##Abseq
+# CAR-P
+# add a column to metadata
+# first use WhichCells to find the cells that express CAR and removing Bcells 
+DefaultAssay(cart.combined) <- "ABSEQ"
+Idents(cart.combined) <- "Cell_type"
+
+CARpD1 <- 
+ WhichCells(object = D1, cells = "11:B cells", invert= TRUE) %>%
+WhichCells(object = D1, expression =`CAR-P.Ab` > log1p(3.3)) 
+
+CARpD2 <- 
+  WhichCells(object = D2, cells = "11:B cells", invert= TRUE) %>%
+WhichCells(object = D2, expression = `CAR-P.Ab` > log1p(2.289436))
+
+CARp <- c(CARpD1, CARpD2)
+
+# cell labels are returned
+head(CARp)
+
+# we then add a new column to the meta data based on the presence of the cell label from WhichCells
+cart.combined$CARp<- ifelse(colnames(cart.combined) %in% CARp, "CARp+", "CARp-")
+
+# set the identities to the new column(s)
+Idents(cart.combined) <- "CARp"
+
+
+
+## VSV-G
+VSV  <- 
+  WhichCells(object = cart.combined, cells = "11:B cells", invert= TRUE)  %>%
+  WhichCells(object = cart.combined, expression = `VSV-G.Ab` > log1p(2.16238))
+
+# cell labels are returned
+head(VSV)
+
+# we then add a new column to the meta data based on the presence of the cell label from WhichCells
+cart.combined$VSV<- ifelse(colnames(cart.combined) %in% VSV, "VSV+", "VSV-")
+
+# set the identities to the new column(s)
+Idents(cart.combined) <- "VSV"
+
+
+
+## His
+His  <- 
+  WhichCells(object = cart.combined, cells = "11:B cells", invert= TRUE)  %>%
+  WhichCells(object = cart.combined, expression = `His.Ab` > log1p(1.3))
+
+# cell labels are returned
+head(His)
+
+# we then add a new column to the meta data based on the presence of the cell label from WhichCells
+cart.combined$His<- ifelse(colnames(cart.combined) %in% His, "His+", "His-")
+
+# set the identities to the new column(s)
+Idents(cart.combined) <- "His"
+
+```
+
+##mutate to have diferent combination of gene and ABSEQ expression
+
+```{r}
+
+cart.combined@meta.data <-
+cart.combined@meta.data %>%
+mutate(CARCARp = case_when(
+CARrna ==
+"CAR+" &
+CARp ==
+"CARp+" ~ "CAR+CARp+",
+
+CARrna == 
+"CAR+" &
+CARp ==
+"CARp-" ~ "CAR+CARp-",
+
+CARrna ==
+"CAR-" &
+CARp ==
+"CARp-" ~ "CAR-CARp-",
+
+CARrna ==
+"CAR-" &
+CARp ==
+"CARp+" ~ "CAR-CARp+"
+
+
+))
+
+
+cart.combined@meta.data <-
+cart.combined@meta.data %>%
+mutate(CARtag = case_when(
+CARrna ==
+"CAR-" &
+His == 
+ "His-" &
+sample == 
+  "CD3_LV"
+~ "CD3_LV.CAR-His-",
+  
+CARrna ==
+"CAR-" &
+His == 
+ "His+" &
+sample == 
+  "CD3_LV"
+~ "CD3_LV.CAR-His+",
+
+CARrna ==
+"CAR+" &
+His == 
+ "His+" &
+sample == 
+  "CD3_LV"
+~ "CD3_LV.CAR+His",
+
+CARrna ==
+"CAR+" &
+His == 
+ "His-" &
+sample == 
+  "CD3_LV"
+~ "CD3_LV.CAR+His",
+
+
+CARrna ==
+"CAR-" &
+His == 
+ "His-" &
+sample == 
+  "CD4_LV"
+~ "CD4_LV.CAR-His-",
+
+CARrna ==
+"CAR-" &
+His == 
+ "His+" &
+sample == 
+  "CD4_LV"
+~ "CD4_LV.CAR-His+",
+
+CARrna ==
+"CAR+" &
+His == 
+ "His+" &
+sample == 
+  "CD4_LV"
+~ "CD4_LV.CAR+His",
+
+CARrna ==
+"CAR+" &
+His == 
+ "His-" &
+sample == 
+  "CD4_LV"
+~ "CD4_LV.CAR+His",
+
+
+CARrna ==
+"CAR-" &
+His == 
+ "His-" &
+sample == 
+  "CD8_LV"
+~ "CD8_LV.CAR-His-",
+
+CARrna ==
+"CAR-" &
+His == 
+ "His+" &
+sample == 
+  "CD8_LV"
+~ "CD8_LV.CAR-His+",
+
+CARrna ==
+"CAR+" &
+His == 
+ "His+" &
+sample == 
+  "CD8_LV"
+~ "CD8_LV.CAR+His",
+
+CARrna ==
+"CAR+" &
+His == 
+ "His-" &
+sample == 
+  "CD8_LV"
+~ "CD8_LV.CAR+His",
+
+
+CARrna ==
+"CAR-" &
+VSV == 
+ "VSV-" &
+sample == 
+  "VSV_LV"
+~ "VSV_LV.CAR-VSV-",
+
+CARrna ==
+"CAR-" &
+VSV == 
+ "VSV+" &
+sample == 
+  "VSV_LV"
+~ "VSV_LV.CAR-VSV+",
+
+CARrna ==
+"CAR+" &
+VSV == 
+ "VSV+" &
+sample == 
+  "VSV_LV"
+~ "VSV_LV.CAR+VSV",
+
+CARrna ==
+"CAR+" &
+VSV == 
+ "VSV-" &
+sample == 
+  "VSV_LV"
+~ "VSV_LV.CAR+VSV"
+
+
+))
+
+
+
+cart.combined@meta.data <-
+cart.combined@meta.data %>%
+mutate(sampleCARCARptag = case_when(
+
+
+CARp ==
+"CARp-" &
+His == 
+ "His-" &
+sample == 
+  "CD3_LV" &
+CARrna == 
+ "CAR-"
+
+~ "CD3_LV.CAR-CARp-His-",
+
+
+CARp ==
+"CARp-" &
+His == 
+ "His+" &
+sample == 
+  "CD3_LV" &
+CARrna == 
+ "CAR-"
+
+~ "CD3_LV.CAR-CARp-His+",
+
+
+CARp ==
+"CARp+" &
+His == 
+ "His+" &
+sample == 
+  "CD3_LV" &
+CARrna == 
+ "CAR+"
+
+~ "CD3_LV.CAR+CARp+His",
+
+
+CARp ==
+"CARp+" &
+His == 
+ "His-" &
+sample == 
+  "CD3_LV" &
+CARrna == 
+ "CAR+"
+
+~ "CD3_LV.CAR+CARp+His",
+
+
+CARp ==
+"CARp-" &
+His == 
+ "His-" &
+sample == 
+  "CD3_LV" &
+CARrna == 
+ "CAR+"
+
+~ "CD3_LV.CAR+CARp-His-",
+
+
+
+
+CARp ==
+"CARp-" &
+His == 
+ "His-" &
+sample == 
+  "CD4_LV" &
+CARrna == 
+ "CAR-"
+
+~ "CD4_LV.CAR-CARp-His-",
+
+
+CARp ==
+"CARp-" &
+His == 
+ "His+" &
+sample == 
+  "CD4_LV" &
+CARrna == 
+ "CAR-"
+
+~ "CD4_LV.CAR-CARp-His+",
+
+
+CARp ==
+"CARp+" &
+His == 
+ "His+" &
+sample == 
+  "CD4_LV" &
+CARrna == 
+ "CAR+"
+
+~ "CD4_LV.CAR+CARp+His",
+
+
+CARp ==
+"CARp+" &
+His == 
+ "His-" &
+sample == 
+  "CD4_LV" &
+CARrna == 
+ "CAR+"
+
+~ "CD4_LV.CAR+CARp+His",
+
+
+CARp ==
+"CARp-" &
+His == 
+ "His-" &
+sample == 
+  "CD4_LV" &
+CARrna == 
+ "CAR+"
+
+~ "CD4_LV.CAR+CARp-His-",
+
+
+
+
+
+CARp ==
+"CARp-" &
+His == 
+ "His-" &
+sample == 
+  "CD8_LV" &
+CARrna == 
+ "CAR-"
+
+~ "CD8_LV.CAR-CARp-His-",
+
+
+CARp ==
+"CARp-" &
+His == 
+ "His+" &
+sample == 
+  "CD8_LV" &
+CARrna == 
+ "CAR-"
+
+~ "CD8_LV.CAR-CARp-His+",
+
+
+CARp ==
+"CARp+" &
+His == 
+ "His+" &
+sample == 
+  "CD8_LV" &
+CARrna == 
+ "CAR+"
+
+~ "CD8_LV.CAR+CARp+His",
+
+
+CARp ==
+"CARp+" &
+His == 
+ "His-" &
+sample == 
+  "CD8_LV" &
+CARrna == 
+ "CAR+"
+
+~ "CD8_LV.CAR+CARp+His",
+
+
+CARp ==
+"CARp-" &
+His == 
+ "His-" &
+sample == 
+  "CD8_LV" &
+CARrna == 
+ "CAR+"
+
+~ "CD8_LV.CAR+CARp-His-",
+
+
+
+
+CARp ==
+"CARp-" &
+VSV == 
+ "VSV-" &
+sample == 
+  "VSV_LV" &
+CARrna == 
+ "CAR-"
+
+~ "VSV_LV.CAR-CARp-VSV-",
+
+
+CARp ==
+"CARp-" &
+VSV == 
+ "VSV+" &
+sample == 
+  "VSV_LV" &
+CARrna == 
+ "CAR-"
+
+~ "VSV_LV.CAR-CARp-VSV+",
+
+
+CARp ==
+"CARp+" &
+VSV == 
+ "VSV+" &
+sample == 
+  "VSV_LV" &
+CARrna == 
+ "CAR+"
+
+~ "VSV_LV.CAR+CARp+VSV",
+
+
+CARp ==
+"CARp+" &
+VSV == 
+ "VSV-" &
+sample == 
+  "VSV_LV" &
+CARrna == 
+ "CAR+"
+
+~ "VSV_LV.CAR+CARp+VSV",
+
+
+CARp ==
+"CARp-" &
+VSV == 
+ "VSV-" &
+sample == 
+  "VSV_LV" &
+CARrna == 
+ "CAR+"
+
+~ "VSV_LV.CAR+CARp-VSV-",
+
+
+))
+
+
+cart.combined@meta.data
+
+```
+
+## Find markers
+
+#####CARCARtagsample-RNA
+```{r}
+Idents(cart.combined) <- "CARCARptagsample"
+abc1 <- FindMarkers(cart.combined, ident.1= "CD3_LV.CAR-CARp-His+", ident.2 = "CD3_LV.CAR+CARp-His+" , logfc.threshold = 0, min.pct = 0.2, test.use = "wilcox", assay = "RNA")
+abc1$FDR <- p.adjust(abc1$p_val, method = "BH")
+abc1$gene = row.names(abc1)
+write_xlsx(abc1, "cart/RNAmarkers-CARCARptagsample.xlsx", col_names = TRUE)
+EnhancedVolcano(abc1, lab = rownames(abc1), x ="avg_log2FC", y ="FDR", title = "CD3_LV. CAR+ versus CAR-", FCcutoff = 0.25, labSize = 4.0,labFace = 'bold', pointSize = 3, legendPosition = 'none', drawConnectors = T,widthConnectors = 1.0, pCutoff = 0.05, colAlpha = 1, cutoffLineType = 'blank', cutoffLineWidth = 0.8, gridlines.major = F, gridlines.minor = F)
+
+
+abc2 <- FindMarkers(cart.combined, ident.1= "CD4_LV.CAR-CARp-His+", ident.2 = "CD4_LV.CAR+CARp-His+" , logfc.threshold = 0, min.pct = 0.2, test.use = "wilcox", assay = "RNA")
+abc2$FDR <- p.adjust(abc2$p_val, method = "BH")
+abc2$gene = row.names(abc2)
+write_xlsx(abc2, "cart/RNAmarkers-CARCARptagsample.xlsx", col_names = TRUE)
+EnhancedVolcano(abc2, lab = rownames(abc2), x ="avg_log2FC", y ="FDR", title = "CD4_LV. CAR+ versus CAR-", FCcutoff = 0.25, labSize = 4.0,labFace = 'bold', pointSize = 3, legendPosition = 'none', drawConnectors = T,widthConnectors = 1.0, pCutoff = 0.05, colAlpha = 1, cutoffLineType = 'blank', cutoffLineWidth = 0.8, gridlines.major = F, gridlines.minor = F)
+
+
+
+abc3 <- FindMarkers(cart.combined, ident.1= "CD8_LV.CAR-CARp-His+", ident.2 = "CD8_LV.CAR+CARp-His+" , logfc.threshold = 0, min.pct = 0.2, test.use = "wilcox", assay = "RNA")
+abc3$FDR <- p.adjust(abc3$p_val, method = "BH")
+abc3$gene = row.names(abc3)
+write_xlsx(abc3, "cart/RNAmarkers-CARCARptagsample.xlsx", col_names = TRUE)
+EnhancedVolcano(abc3, lab = rownames(abc3), x ="avg_log2FC", y ="FDR", title = "CD8_LV. CAR+ versus CAR-", FCcutoff = 0.25, labSize = 4.0,labFace = 'bold', pointSize = 3, legendPosition = 'none', drawConnectors = T,widthConnectors = 1.0, pCutoff = 0.05, colAlpha = 1, cutoffLineType = 'blank', cutoffLineWidth = 0.8, gridlines.major = F, gridlines.minor = F)
+
+
+
+abc4 <- FindMarkers(cart.combined, ident.1= "VSV_LV.CAR-CARp-VSV+", ident.2 = "VSV_LV.CAR+CARp-VSV+" , logfc.threshold = 0, min.pct = 0.2, test.use = "wilcox", assay = "RNA")
+abc4$FDR <- p.adjust(abc4$p_val, method = "BH")
+abc4$gene = row.names(abc4)
+write_xlsx(list(`CD3-LV. CAR+ vs. CAR-` = abc1,  `CD4-LV. CAR+ vs. CAR-` = abc2, `CD8-LV. CAR+ vs. CAR-` = abc3,`VSV-LV. CAR+ vs. CAR-` = abc4), "cart/RNAmarkers-CARCARptagsample.xlsx", col_names = TRUE)
+EnhancedVolcano(abc4, lab = rownames(abc4), x ="avg_log2FC", y ="FDR", title = "VSV_LV. CAR+ versus CAR-", FCcutoff = 0.25, labSize = 4.0,labFace = 'bold', pointSize = 3, legendPosition = 'none', drawConnectors = T,widthConnectors = 1.0, pCutoff = 0.05, colAlpha = 1, cutoffLineType = 'blank', cutoffLineWidth = 0.8, gridlines.major = F, gridlines.minor = F, xlim = c(-3,3))
+
+```
+
+
+#####CARtag-RNA
+##### compare different populations of the cells having CAR or vector signal
+
+```{r}
+
+Idents(cart.combined) <- "CARtag"
+
+# VSV-LV: comparing CAR-VSV+ cells to CAR+
+b1 <- FindMarkers(cart.combined, ident.1= "VSV_LV.CAR-VSV+", ident.2 = "VSV_LV.CAR+VSV" , logfc.threshold = 0, min.pct = 0.2, test.use = "wilcox", assay = "RNA", latent.vars = "donor")
+b1$FDR <- p.adjust(b1$p_val, method = "BH")
+b1$gene = row.names(b1)
+write_xlsx(b1, "cart/RNAmarkers-CARtag-wilcox.xlsx", col_names = TRUE)
+EnhancedVolcano(b1, lab = rownames(b1), x ="avg_log2FC", y ="FDR", title = "VSV-LV. CAR+ versus CAR-VSV+", FCcutoff = 0.25, labSize = 4.0,labFace = 'bold', pointSize = 3, legendPosition = 'below', drawConnectors = T,widthConnectors = 1.0, pCutoff = 0.05, colAlpha = 1, cutoffLineType = 'blank', cutoffLineWidth = 0.8, gridlines.major = F, gridlines.minor = F,xlim = c(-3,3),   selectLab = c("IL5","CCR5", "CCL5","CD74", "IFITM3", "APOBEC3G","HLA-DPA1", "HLA-DQB1", "HLA-DRA","HLA-DMA", "IER3", "DUSP2", "DUSP4", "PDCD1", "HAVCR2", "LAG3", "EGR1", "CAR", "CSF2", "CTLA4", "GZMA", "GNLY", "TARP", "TIGIT", "POU2AF1", "CD200", "ZBED2",  "FOXP3", "CD4", "CD2", "LGALS1", "CBLB", "CD27", "SLC7A5", "MZB1", "LIF", "SLC3A2", "CD44", "RGS1", "CD8A", "KLRK1", "CD28", "MZB1",  "CD40LG", "VEGFA", "STAT1", "SAMHD1", "IFI6", "MX1"))
+
+
+# CD3-LV: comparing CAR-VSV+ cells to CAR+
+b2 <- FindMarkers(cart.combined, ident.1= "CD3_LV.CAR-His+", ident.2 = "CD3_LV.CAR+His" , logfc.threshold = 0, min.pct = 0.2, test.use = "wilcox", assay = "RNA")
+b2$FDR <- p.adjust(b2$p_val, method = "BH")
+b2$gene = row.names(b2)
+#write_xlsx(b2, "cart/RNAmarkers-CARtag.xlsx", col_names = TRUE)
+EnhancedVolcano(b2, lab = rownames(b2), x ="avg_log2FC", y ="FDR", title = "CD3-LV. CAR+ versus CAR-VSV+", FCcutoff = 0.25, labSize = 4.0,labFace = 'bold', pointSize = 3, legendPosition = 'none', drawConnectors = T,widthConnectors = 1.0, pCutoff = 0.05, colAlpha = 1, cutoffLineType = 'blank', cutoffLineWidth = 0.8, gridlines.major = F, gridlines.minor = F,xlim = c(-1.5,1.5),max.overlaps = 60, selectLab = c("CHI3L2","CCR5", "TOP2A","NKG7", "IFITM3", "HLA-DQB1", "DUSP2", "DUSP4", "BCL6", "IL18R1", "CD8A", "AURKB", "CAR", "CSF2", "CTLA4", "GZMA", "PASK", "ITGAX", "ZBED2", "EGR1", "SELL", "CD4", "JUNB","DUSP1", "CD8A", "IFITM2", "CXCR6", "TOP2A", "MYB", "PSMA3", "CD28", "KLRK1", "CD2"))
+
+
+# CD4-LV: comparing CAR-VSV+ cells to CAR+
+b3 <- FindMarkers(cart.combined, ident.1= "CD4_LV.CAR-His+", ident.2 = "CD4_LV.CAR+His" , logfc.threshold = 0, min.pct = 0.2, test.use = "wilcox", assay = "RNA")
+b3$FDR <- p.adjust(b3$p_val, method = "BH")
+b3$gene = row.names(b3)
+EnhancedVolcano(b3, lab = rownames(b3), x ="avg_log2FC", y ="FDR", title = "CD4-LV. CAR+ versus CAR-VSV+", FCcutoff = 0.25, labSize = 4.0,labFace = 'bold', pointSize = 3, legendPosition = 'none', drawConnectors = T,widthConnectors = 1.0, pCutoff = 0.05, colAlpha = 1, cutoffLineType = 'blank', cutoffLineWidth = 0.8, gridlines.major = F, gridlines.minor = F,xlim = c(-3,3), max.overlaps = 60, selectLab = c("IL7R","FAM65B", "GZMA","RGS1", "STAT1", "TRIB2", "TRAT1", "TXK", "SELL", "SELPLG", "SAMHD1", "IFITM3", "CCR2", "DPP4", "IFI6", "MX1", "IFITM2", "ADAR", "HLA-A","CSF2", "ZBED2", "IFNG", "IER3", "DUSP4", "LAG3", "FOXP3","CTLA4","DUSP2","CD200","POU2AF1", "NAMPT", "CCL4", "LTA", "CCL3", "TFRC", "CD70", "IL13", "CCL22", "CXCR4", "ARL4C", "IL32", "CD52", "MZB1", "YBX3", "SLC7A5", "LAIR2"))
+
+
+# CD8-LV: comparing CAR-VSV+ cells to CAR+
+b4 <- FindMarkers(cart.combined, ident.1= "CD8_LV.CAR-His+", ident.2 = "CD8_LV.CAR+His" , logfc.threshold = 0, min.pct = 0.2, test.use = "wilcox", assay = "RNA")
+b4$FDR <- p.adjust(b4$p_val, method = "BH")
+b4$gene = row.names(b4)
+#write_xlsx(b4, "cart/RNAmarkers-CARtag.xlsx", col_names = TRUE)
+EnhancedVolcano(b4, lab = rownames(b4), x ="avg_log2FC", y ="FDR", title = "CD8-LV. CAR+ versus CAR-VSV+", FCcutoff = 0.25, labSize = 4.0,labFace = 'bold', pointSize = 3, legendPosition = 'none', drawConnectors = T,widthConnectors = 1.0, pCutoff = 0.05, colAlpha = 1, cutoffLineType = 'blank', cutoffLineWidth = 0.8, gridlines.major = F, gridlines.minor = F,xlim = c(-3.2,3.2), max.overlaps = 50, selectLab = c("TRIB2","IFITM3", "IFITM2","CCR2", "FAM65B", "IL7R", "SELPLG", "LGALS3", "BIN2", "GZMA", "SAMHD1", "STAT1", "HLA-DRA", "IFI6", "MX1","CSF2", "ZBED2", "IFNG", "IER3", "CCL3", "CCL4", "LAG3","DUSP4","DUSP2","GZMB","LAG3", "NAMPT", "FOXP3", "LTA", "CTLA4", "TFRC", "CD70", "IL13", "CCL22", "CXCR4", "YBX3", "SLC7A5", "LAIR2", "TIGIT", "XCL1", "ENTPD1", "MYB", "TFRC", "XCL1", "CD2", "IL2RA", "ICOS", "IL12RB2", "SLC7A5", "KLRC1", "BIRC3", "VEGFA", "CD70"))
+
+```
+
+
+## ggplot vlnplots with noise comparison sampleCARCARptag
+####RNA
+```{r}
+## Add column to metadata for
+## Add another metadata column to group  sampleCARCARptag and donor columns
+cart.combined$sampleCARCARptagdonor <- paste0(cart.combined$sampleCARCARptag ,"_", cart.combined$donor)
+
+# choose a vector of genes
+gene <- c("IFITM2","IFITM3", "SAMHD1", "STAT1", "ADAR", "IFI6", "MX1", "OAS2","TRIM22", "APOBEC3G", "DUSP2", "DUSP4")
+#gene <- c("HLA-DPA1", "HLA-DQB1", "HLA-DRA","HLA-DMA", "HLA-A","TBX21", "IER3", "DUSP2", "DUSP4","HAVCR2", "LAG3" )
+
+
+DefaultAssay(cart.combined) <- "RNA"
+Idents(cart.combined) <- "sampleCARCARptag"
+
+##### Choose each of the below samples and compare list based on the population of interest to check in vln plots
+
+#### All samples
+# subset <- subset(x = cart.combined, subset = sampleCARCARptag %in% c("CD3_LV.CAR-CARp-His-", "CD3_LV.CAR-CARp-His+", "CD3_LV.CAR+CARp+His", "CD4_LV.CAR-CARp-His-", "CD4_LV.CAR-CARp-His+", "CD4_LV.CAR+CARp+His","CD8_LV.CAR-CARp-His-","CD8_LV.CAR-CARp-His+","CD8_LV.CAR+CARp+His",
+# "VSV_LV.CAR-CARp-VSV-","VSV_LV.CAR-CARp-VSV+", "VSV_LV.CAR+CARp+VSV" ))
+# 
+# compare <- list(      c("CD3_LV.CAR-CARp-His-", "CD3_LV.CAR-CARp-His+"),
+#                       c("CD3_LV.CAR-CARp-His+", "CD3_LV.CAR+CARp+His"),
+#                       c("CD4_LV.CAR-CARp-His-", "CD4_LV.CAR-CARp-His+"),
+#                       c("CD4_LV.CAR-CARp-His+", "CD4_LV.CAR+CARp+His"),
+#                       c("CD8_LV.CAR-CARp-His-", "CD8_LV.CAR-CARp-His+"),
+#                       c("CD8_LV.CAR-CARp-His+","CD8_LV.CAR+CARp+His"), 
+#                       c("VSV_LV.CAR-CARp-VSV-", "VSV_LV.CAR-CARp-VSV+"),
+#                       c("VSV_LV.CAR-CARp-VSV+", "VSV_LV.CAR+CARp+VSV"))
+
+
+
+
+#### CD4 and CD8 samples
+# subset1 <- subset(x = cart.combined, subset = sampleCARCARptag %in% c("CD4_LV.CAR-CARp-His-", "CD4_LV.CAR-CARp-His+", "CD4_LV.CAR+CARp+His","CD8_LV.CAR-CARp-His-", "CD8_LV.CAR-CARp-His+","CD8_LV.CAR+CARp+His"))
+# 
+# compare <- list(     c("CD4_LV.CAR-CARp-His-", "CD4_LV.CAR-CARp-His+"),
+#                       c("CD4_LV.CAR-CARp-His+", "CD4_LV.CAR+CARp+His"),
+#                       c("CD8_LV.CAR-CARp-His-", "CD8_LV.CAR-CARp-His+"),
+#                       c("CD8_LV.CAR-CARp-His+","CD8_LV.CAR+CARp+His"))
+
+
+##### CD3 and VSV samples
+# subset2 <- subset(x = cart.combined, subset = sampleCARCARptag %in% c("VSV_LV.CAR-CARp-VSV-", "VSV_LV.CAR-CARp-VSV+", "VSV_LV.CAR+CARp+VSV","CD3_LV.CAR-CARp-His-", "CD3_LV.CAR-CARp-His+", "CD3_LV.CAR+CARp+His"))
+# 
+# compare <- list( c("VSV_LV.CAR-CARp-VSV-", "VSV_LV.CAR-CARp-VSV+"),
+#                       c("VSV_LV.CAR-CARp-VSV+", "VSV_LV.CAR+CARp+VSV"),
+#                       c("CD3_LV.CAR-CARp-His-", "CD3_LV.CAR-CARp-His+"),
+#                       c("CD3_LV.CAR-CARp-His+", "CD3_LV.CAR+CARp+His"))
+
+##### Donor1 VSV
+
+# Idents(cart.combined) <- "sampleCARCARptagdonor"
+# subsetD1 <- subset(x = cart.combined, subset = sampleCARCARptagdonor %in% c( "VSV_LV.CAR-CARp-VSV-_D1", "VSV_LV.CAR-CARp-VSV+_D1", "VSV_LV.CAR+CARp+VSV_D1" ))
+# 
+# 
+# 
+# compare <- list( c("VSV_LV.CAR-CARp-VSV-_D1", "VSV_LV.CAR-CARp-VSV+_D1"),
+#                       c("VSV_LV.CAR-CARp-VSV+_D1", "VSV_LV.CAR+CARp+VSV_D1"))
+                 
+
+##### Donor2 VSV
+
+     
+# Idents(cart.combined) <- "sampleCARCARptagdonor"
+# Idents(cart.combined) <- "sampleCARCARptagdonor"
+# subsetD2 <- subset(x = cart.combined, subset = sampleCARCARptagdonor %in% c( "VSV_LV.CAR-CARp-VSV-_D2", "VSV_LV.CAR-CARp-VSV+_D2", "VSV_LV.CAR+CARp+VSV_D2" ))
+# 
+# 
+# 
+# compare <- list( c("VSV_LV.CAR-CARp-VSV-_D2", "VSV_LV.CAR-CARp-VSV+_D2"),
+#                       c("VSV_LV.CAR-CARp-VSV+_D2", "VSV_LV.CAR+CARp+VSV_D2"))
+
+ 
+vln_df <- list()
+plot_list_vln_df <- list()
+pwc <- list()
+p.val.size <- 6
+plot.title.size <- 20
+set.seed(42)
+
+# choose the right color list based on the samples to be plotted
+
+
+# mycolors <- c("#8B2252", "#CD3278", "#FF3E96", "#8B5A00", "#CD8500", "#FFA500", "#104E8B", "#1874CD", "#63B8FF", "#2E8B57", "#43CD80", "#9AFF9A")
+
+#mycolors <- c( "#8B5A00", "#CD8500", "#FFA500", "#104E8B", "#1874CD", "#63B8FF")
+
+#mycolors <- c("#8B2252", "#CD3278", "#FF3E96", "#2E8B57", "#43CD80", "#9AFF9A")
+
+#mycolors <- c("#2E8B57", "#43CD80", "#9AFF9A")
+
+# Loop over genes
+for(i in gene){
+
+#  violin plot without noise. change object based on the SUBSET name and the active IDENT should be added to $...
+  
+  ##e.g vln_df[[i]] = data.frame(Expression=SUBSET[["RNA"]]@data[i,], Subset = subset$IDENT)
+vln_df[[i]] = data.frame(Expression=subset1[["RNA"]]@data[i,], Subset = subset1$sampleCARCARptag)
+
+  
+#Statistics
+pwc[[i]] <- vln_df[[i]] %>%
+  wilcox_test(Expression ~ Subset, p.adjust.method = "none", comparisons = compare)
+pwc[[i]] <- pwc[[i]] %>% add_xy_position(x = "Subset")
+pwc[[i]]$FDR <- p.adjust(pwc[[i]]$p, method = "BH")#, n=length(gene))
+pwc[[i]] <- add_significance(pwc[[i]], p.col = "FDR", output.col = "FDR.signif")
+
+# Graphs
+# Add noise for optimal visualization purposes like VlnPlot() 
+#noise <- rnorm(n = length(x = vln_df[[i]][, "Expression"])) / 1000
+noise <- rnorm(n = length(x = vln_df[[i]][, "Expression"]), sd = 1)
+vln_df[[i]]$Expression <- vln_df[[i]]$Expression  + noise
+
+# Variable stats position.
+### OBS! MIGHT NEED TO BE ADJUSTED for the hight of the p-value symbols and lines!!###
+y.position <- seq(max(vln_df[[i]]$Expression),max(vln_df[[i]]$Expression)+ 0.5 , by=0.5)
+
+# Variable ylim range
+ylim <- ylim(0, max(y.position)+0.1)
+
+
+
+# violin plot with noise
+if(i != gene[length(gene)]){
+  if (any(i == gene[seq(1, length(gene),by=7)])){
+  plot_list_vln_df[[i]] <- vln_df[[i]] %>%
+ggplot(mapping=aes(x=Subset, y=Expression)) + geom_violin(mapping=aes(x=Subset, y=Expression, fill= Subset), scale = "width", width= 0.7)+ scale_x_manual(values = c(1:3, 5:7, 9:11, 13:15)) +scale_fill_manual(values = alpha((mycolors),0.9))+ geom_boxplot(outlier.size = 0.01, width=0.3, size=0.5, alpha=0.4) + 
+    theme_bw()+
+    xlab("") +
+  ggtitle(label=i) +
+  stat_pvalue_manual(pwc[[i]],  hide.ns = F, y.position = y.position, label = "FDR.signif", size = p.val.size, tip.length = 0)+
+  labs(subtitle = get_test_label(vln_df[[i]] %>% kruskal_test(Expression ~ Subset) %>% mutate(KW_FDR = p.adjust (p, method='BH')) %>% add_significance(p.col = "KW_FDR"), p.col = "KW_FDR.signif", detailed=F, description = NULL))+ylim +
+  theme(panel.grid = element_blank(),axis.title.y = element_text(size = 12), axis.text.y = element_text(size=12), axis.text.x = element_blank(), axis.ticks.x = element_blank(), plot.title = element_text(hjust = 0.5, size=plot.title.size, face = "bold"), plot.subtitle = element_blank())+ylab("Expression")+ theme(legend.position = "none" , aspect.ratio = 1)
+} 
+  else {
+  plot_list_vln_df[[i]] <- vln_df[[i]] %>%
+ggplot(mapping=aes(x=Subset, y=Expression)) + geom_violin(mapping=aes(x=Subset, y=Expression, fill= Subset), scale = "width",  width= 0.7) + scale_x_manual(values= c(1:3, 5:7, 9:11, 13:15)) +scale_fill_manual(values = alpha((mycolors),0.9))+ geom_boxplot(outlier.size = 0.01, width=0.3, size=0.5, alpha=0.4) +
+    theme_bw()+
+  xlab("") +
+  ggtitle(label=i) +
+  stat_pvalue_manual(pwc[[i]],  hide.ns = F, y.position =  y.position, label = "FDR.signif", size = p.val.size, tip.length = 0) +
+  labs(subtitle = get_test_label(vln_df[[i]] %>% kruskal_test(Expression ~ Subset) %>% mutate(KW_FDR = p.adjust (p, method='BH')) %>% add_significance(p.col = "KW_FDR"), p.col = "KW_FDR.signif", detailed=F, description = NULL))+ylim +
+  theme(panel.grid = element_blank(),axis.title.y = element_text(size = 12), axis.text.y = element_text(size=12), axis.text.x = element_blank(), axis.ticks.x = element_blank(), plot.title = element_text(hjust = 0.5, size=plot.title.size, face = "bold"), plot.subtitle = element_blank())+ylab("Expression")+ theme(legend.position = "none",  aspect.ratio = 1)
+}
+}
+else{plot_list_vln_df[[i]] <- vln_df[[i]] %>%
+ggplot(mapping=aes(x=Subset, y=Expression)) + geom_violin(mapping=aes(x=Subset, y=Expression, fill= Subset) ,scale = "width",  width=0.7) + scale_x_manual(values =c(1:3, 5:7, 9:11, 13:15)) +scale_fill_manual(values = alpha((mycolors),0.9))+ geom_boxplot(outlier.size = 0.01, width=0.3, size=0.5, alpha=0.4) + 
+    theme_bw()+
+  xlab("") +
+  ggtitle(label=i) +
+  stat_pvalue_manual(pwc[[i]],  hide.ns = F, y.position =  y.position, label = "FDR.signif", size = p.val.size, tip.length = 0) +
+  labs(subtitle = get_test_label(vln_df[[i]] %>% kruskal_test(Expression ~ Subset) %>% mutate(KW_FDR = p.adjust (p, method='BH', n=length(gene))) %>% add_significance(p.col = "KW_FDR"), p.col = "KW_FDR.signif", detailed=F, description = NULL))+ylim +
+  theme(panel.grid = element_blank(),axis.title.y = element_text(size = 12), axis.text.y = element_text(size=12), axis.text.x = element_blank(), axis.ticks.x = element_blank(), plot.title = element_text(hjust = 0.5, size=plot.title.size, face = "bold"), plot.subtitle = element_blank()) +
+  theme(legend.title = element_text(size = 12), legend.text = element_text(size = 12), legend.key.size = unit(0.3, "cm"), aspect.ratio = 1)+ylab("Expression")
+}
+}
+
+```
+
+
+```{r}
+# Set the factor "f" to adjust the height of the exported pdf and play around with width
+#f = 4 w = 13 col = 3
+f = 4
+w = 13
+col = 3
+h = f*if(length(gene)==any(seq(col,length(gene),by=col))){length(gene)} else{(length(gene)/col)+0.5}
+n = if(length(gene)==any(seq(col,length(gene),by=col))){length(gene)/col} else{(length(gene)/col)+0.5}
+
+ggsave("cart/vln/CD4CD8ISGs.pdf", plot=ggarrange(plotlist=plot_list_vln_df, ncol = col, nrow=n, common.legend = T, legend = "none"), width = w, height = h, limitsize = F)
+```
+
+# Vennplots
+Creating a gene list. If y axis in the plots is not located in the first plot in every line, check for duplicate genes in the gene list.
+####CARCARp 
+
+```{r}
+## Upregulated genes
+
+# CAR+CARp- VS CAR+CARp+.CD3_LV
+gene1<- subset(f %>% arrange(desc(avg_log2FC)), FDR < 0.05 & avg_log2FC >= 0.25)$gene
+
+# CAR+CARp- VS CAR+CARp+.CD4_LV
+gene2 <- subset(h %>% arrange(desc(avg_log2FC)), FDR < 0.05 & avg_log2FC >= 0.25)$gene
+
+# CAR+CARp- VS CAR+CARp+.CD8_LV
+gene3 <- subset(j %>% arrange(desc(avg_log2FC)), FDR < 0.05 & avg_log2FC >= 0.25)$gene
+
+# CAR+CARp- VS CAR+CARp+.VSV_LV
+gene4 <- subset(d %>% arrange(desc(avg_log2FC)), FDR < 0.05 & avg_log2FC >= 0.25)$gene
+
+
+## downregulated genes
+
+# CAR+CARp- VS CAR+CARp+.CD3_LV
+gene5 <- subset(f %>% arrange(desc(avg_log2FC)), FDR < 0.05 & avg_log2FC <= -0.25)$gene
+
+# CAR+CARp- VS CAR+CARp+.CD4_LV
+gene6 <- subset(h %>% arrange(desc(avg_log2FC)), FDR < 0.05 & avg_log2FC <= -0.25)$gene
+
+# CAR+CARp- VS CAR+CARp+.CD8_LV
+gene7 <- subset(j %>% arrange(desc(avg_log2FC)), FDR < 0.05 & avg_log2FC <= -0.25)$gene
+
+# CAR+CARp- VS CAR+CARp+.VSV_LV
+gene8 <- subset(d %>% arrange(desc(avg_log2FC)), FDR < 0.05 & avg_log2FC <= -0.25)$gene
+
+```
+
+```{r}
+## upregulated genes in comparing CAR+CARp- VS CAR+CARp+ for all vectors
+y <- list(
+  CD3_LV = gene1,
+  CD4_LV = gene2,
+  CD8_LV = gene3,
+  VSV_LV = gene4
+  )
+
+#create venn plot
+ggVennDiagram((y),category.names = c("CD3_LV", "CD4_LV", "CD8_LV", "VSV_LV"), label_alpha = 1, label = "count", label_size = 10)+theme(legend.position = "none", plot.title = element_text(size = rel(1.2)))  + labs( title =  "genes upregulated in CAR+CARp- compare to CAR+CARp+")
+
+# genes in the intersect 
+Reduce(intersect,y)
+
+
+## downregulated genes in comparing CAR+CARp- VS CAR+CARp+ for all vectors
+
+x <- list(
+  CD3_LV = gene5,
+  CD4_LV = gene6,
+  CD8_LV = gene7,
+  VSV_LV = gene8
+)
+
+ggVennDiagram((x),category.names = c("CD3_LV", "CD4_LV", "CD8_LV", "VSV_LV"), label_alpha = 1, label = "count", label_size = 10)+theme(legend.position = "none", plot.title = element_text(size = rel(1.2)))  + labs( title =  "genes downregulated in CAR+CARp- compare to CAR+CARp+")
+
+Reduce(intersect,x)
+
+```
+
+
